@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.env
+*.log
+*.pkl
+*.csv
+*.xlsx
+relatorios/
+data/modelos/
