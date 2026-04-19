@@ -385,6 +385,167 @@ class ICMSAnalyzer:
     # AUXILIARES
     # ─────────────────────────────────────────
 
+
+    def analisar(self, dado) -> "ResultadoAnaliseICMS":
+        """
+        Metodo unificado que aceita DadoFiscalNormalizado.
+        Substitui analisar_nfe() e analisar_nota_sped() no pipeline.
+        Os metodos originais continuam funcionando para uso direto.
+        """
+        from normalizer import DadoFiscalNormalizado
+        if isinstance(dado, DadoFiscalNormalizado):
+            return self._analisar_normalizado(dado)
+        raise TypeError(f"Esperado DadoFiscalNormalizado, recebido {type(dado)}")
+
+    def _analisar_normalizado(self, dado) -> "ResultadoAnaliseICMS":
+        """Analisa um DadoFiscalNormalizado (NF-e ou SPED)."""
+        resultado = ResultadoAnaliseICMS(
+            identificador=dado.chave or f"NF-{dado.numero}",
+            uf=self.uf,
+            total_icms_documento=dado.totais.vl_icms,
+        )
+
+        uf_emit = dado.emitente.uf.upper() if dado.emitente.uf else ""
+        uf_dest = dado.destinatario.uf.upper() if dado.destinatario.uf else ""
+        is_interestadual = bool(uf_emit and uf_dest and uf_emit != uf_dest)
+        is_consumidor_final = not dado.destinatario.ie or dado.destinatario.ie in ("", "ISENTO")
+        crt = dado.emitente.crt
+        tipo_nf = dado.tipo_nf
+
+        for item in dado.itens:
+            divs = self._analisar_item_por_campos(
+                num_item=item.num_item,
+                descricao=item.descricao,
+                cst=item.cst_icms,
+                cfop=item.cfop,
+                aliq=item.aliq_icms,
+                vl_bc=item.vl_bc_icms,
+                vl_icms=item.vl_icms,
+                uf_emit=uf_emit,
+                uf_dest=uf_dest,
+                is_interestadual=is_interestadual,
+                is_consumidor_final=is_consumidor_final,
+                tipo_nf=tipo_nf,
+                vl_bc_fcp=item.vl_bc_fcp,
+            )
+            resultado.divergencias.extend(divs)
+
+        # Verifica totais
+        soma_icms = sum(i.vl_icms for i in dado.itens)
+        if abs(soma_icms - dado.totais.vl_icms) > 0.05:
+            resultado.divergencias.append(Divergencia(
+                tipo="ICMS_TOTAL_DIVERGE_ITENS",
+                gravidade="CRITICA",
+                descricao=f"Total ICMS (R$ {dado.totais.vl_icms:.2f}) difere da soma dos itens (R$ {soma_icms:.2f}).",
+                orientacao="Recalcule o ICMS por item e atualize o total do documento.",
+                valor_encontrado=f"R$ {dado.totais.vl_icms:.2f}",
+                valor_esperado=f"R$ {soma_icms:.2f}",
+                referencia_legal="NT 2014/002 SEFAZ"
+            ))
+
+        resultado.total_icms_esperado = sum(
+            round(i.vl_bc_icms * i.aliq_icms / 100, 2)
+            for i in dado.itens if i.cst_icms in CST_COM_ICMS and i.aliq_icms > 0
+        )
+        resultado.diferenca_icms = abs(
+            resultado.total_icms_documento - resultado.total_icms_esperado
+        )
+        resultado.risco_calculado = self._risco_simples(resultado)
+        return resultado
+
+    def _analisar_item_por_campos(
+        self, num_item, descricao, cst, cfop, aliq, vl_bc, vl_icms,
+        uf_emit, uf_dest, is_interestadual, is_consumidor_final, tipo_nf,
+        vl_bc_fcp=0.0,
+    ):
+        """Logica de analise de item por campos primitivos (reutilizavel)."""
+        from config import TOLERANCIA_PERCENTUAL, TOLERANCIA_ALIQUOTA, CST_COM_ICMS, CST_SEM_ICMS
+        divs = []
+
+        if not cst:
+            divs.append(Divergencia(
+                tipo="ICMS_CST_VAZIO", gravidade="CRITICA",
+                descricao=f"Item {num_item} ({descricao[:40]}): CST/CSOSN nao informado.",
+                orientacao="Preencha o CST correto. Para SN use CSOSN.",
+                referencia_legal="Art. 12 Ajuste SINIEF 07/05"
+            ))
+            return divs
+
+        if cst in CST_COM_ICMS and aliq == 0.0 and vl_bc > 0:
+            divs.append(Divergencia(
+                tipo="ICMS_ALIQ_ZERADA_CST_TRIBUTADO", gravidade="CRITICA",
+                descricao=f"Item {num_item}: CST {cst} exige ICMS mas aliquota zerada.",
+                orientacao=f"Aliquota padrao MT: {self.aliq_interna['padrao']}%. Verifique beneficio fiscal.",
+                valor_encontrado=f"{aliq}%",
+                valor_esperado=f"{self.aliq_interna['padrao']}%",
+                referencia_legal="RICMS-MT"
+            ))
+
+        if cst in CST_SEM_ICMS and vl_icms > 0:
+            divs.append(Divergencia(
+                tipo="ICMS_INDEVIDO_CST_ISENTO", gravidade="ALTA",
+                descricao=f"Item {num_item}: CST {cst} (isento/NT) mas vl_icms = R$ {vl_icms:.2f}.",
+                orientacao="Zere o ICMS ou corrija o CST.",
+                valor_encontrado=f"R$ {vl_icms:.2f}", valor_esperado="R$ 0,00",
+                referencia_legal="RICMS-MT"
+            ))
+
+        if is_interestadual and cst in CST_COM_ICMS and aliq > 0:
+            aliq_esp = self._aliq_interestadual_esperada(uf_emit, uf_dest)
+            if abs(aliq - aliq_esp) > TOLERANCIA_ALIQUOTA:
+                divs.append(Divergencia(
+                    tipo="ICMS_ALIQ_INTERESTADUAL_INCORRETA", gravidade="ALTA",
+                    descricao=f"Item {num_item}: Aliquota {aliq}% incorreta para {uf_emit}->{uf_dest}.",
+                    orientacao=f"Aliquota esperada: {aliq_esp}% (tabela CONFAZ). CFOP: {cfop}.",
+                    valor_encontrado=f"{aliq}%", valor_esperado=f"{aliq_esp}%",
+                    referencia_legal="Resolucao SF 22/1989 / EC 87/2015"
+                ))
+
+        if cst in CST_COM_ICMS and aliq > 0 and vl_bc > 0:
+            vl_calc = round(vl_bc * aliq / 100, 2)
+            if abs(vl_calc - vl_icms) > TOLERANCIA_PERCENTUAL:
+                divs.append(Divergencia(
+                    tipo="ICMS_VALOR_DIVERGENTE_BC", gravidade="ALTA",
+                    descricao=f"Item {num_item}: ICMS calculado (R$ {vl_calc:.2f}) difere do informado (R$ {vl_icms:.2f}).",
+                    orientacao="Verifique BC ou reducao nao declarada.",
+                    valor_encontrado=f"R$ {vl_icms:.2f}",
+                    valor_esperado=f"R$ {vl_calc:.2f} ({vl_bc:.2f} x {aliq}%)",
+                    referencia_legal="RICMS-MT"
+                ))
+
+        if cfop:
+            divs.extend(self._verificar_cfop_simples(num_item, cfop, tipo_nf, is_interestadual))
+
+        return divs
+
+    def _verificar_cfop_simples(self, num_item, cfop, tipo_nf, is_interestadual):
+        divs = []
+        if not cfop:
+            return divs
+        d1 = cfop[0]
+        if tipo_nf == "1" and d1 not in ("5","6","7"):
+            divs.append(Divergencia(
+                tipo="CFOP_SAIDA_INCORRETO", gravidade="ALTA",
+                descricao=f"Item {num_item}: NF de saida com CFOP {cfop} (inicia com {d1}).",
+                orientacao="Saidas estaduais: 5.xxx | interestaduais: 6.xxx | exportacao: 7.xxx.",
+                valor_encontrado=cfop, referencia_legal="Ajuste SINIEF 07/05"
+            ))
+        if tipo_nf == "0" and d1 not in ("1","2","3"):
+            divs.append(Divergencia(
+                tipo="CFOP_ENTRADA_INCORRETO", gravidade="ALTA",
+                descricao=f"Item {num_item}: NF de entrada com CFOP {cfop} (inicia com {d1}).",
+                orientacao="Entradas estaduais: 1.xxx | interestaduais: 2.xxx | importacao: 3.xxx.",
+                valor_encontrado=cfop, referencia_legal="Ajuste SINIEF 07/05"
+            ))
+        if is_interestadual and d1 in ("5","1"):
+            divs.append(Divergencia(
+                tipo="CFOP_ESTADUAL_EM_INTERESTADUAL", gravidade="MEDIA",
+                descricao=f"Item {num_item}: Operacao interestadual com CFOP estadual {cfop}.",
+                orientacao="Use CFOP 6.xxx (saida) ou 2.xxx (entrada) para operacoes interestaduais.",
+                valor_encontrado=cfop, referencia_legal="Ajuste SINIEF 07/05"
+            ))
+        return divs
+
     def _aliq_interestadual_esperada(self, uf_orig: str, uf_dest: str) -> float:
         """Retorna alíquota interestadual esperada pela tabela CONFAZ."""
         regioes_sul_sudeste = {"SP", "RJ", "MG", "ES", "RS", "SC", "PR"}

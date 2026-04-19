@@ -1,270 +1,313 @@
-# analyzers/ncm_analyzer.py
+# analyzers/icms_st_analyzer.py
 """
-Validação de NCM (Nomenclatura Comum do Mercosul).
-Usa tabela local CSV para MT/MS.
-A tabela pode ser expandida manualmente ou importada da Receita Federal.
+Analise de ICMS por Substituicao Tributaria (ICMS-ST) - MT.
+
+MVAs carregados de data/mva_mt.csv (versionavel, editavel sem alterar codigo).
+Formato do CSV:
+  ncm_prefixo, descricao, mva_interno, mva_ajustado_12,
+  aliq_interna, ativo, fonte
+
+Para atualizar MVAs: edite data/mva_mt.csv e reinicie o sistema.
+Nao e necessario alterar este arquivo.
+
+Referencias:
+  - Protocolo ICMS 41/2008 (combustiveis)
+  - Convenio ICMS 142/2018 (bebidas)
+  - Protocolo ICMS 76/2014 (medicamentos)
+  - TARE-MT (Termo de Acordo de Regime Especial)
 """
 
 import csv
-from pathlib import Path
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from config import NCM_MT_CSV, NCM_MS_CSV
+
+from config import TOLERANCIA_PERCENTUAL, CST_COM_ST, DATA_DIR
+
+log = logging.getLogger(__name__)
+
+# Caminho do CSV de MVAs (versionavel)
+MVA_CSV_PATH: Path = DATA_DIR / "mva_mt.csv"
 
 
 @dataclass
-class RegrasNCM:
-    """Regras fiscais para um NCM específico"""
-    ncm: str
+class ResultadoST:
+    """Resultado da analise de ST de um item."""
+    num_item: str
     descricao: str
-    aliq_icms_mt: float = 17.0
-    aliq_icms_ms: float = 17.0
-    tem_st_mt: bool = False
-    tem_st_ms: bool = False
-    reducao_bc_mt: float = 0.0
-    reducao_bc_ms: float = 0.0
-    isento_mt: bool = False
-    isento_ms: bool = False
-    observacoes: str = ""
-
-
-@dataclass
-class ResultadoNCM:
     ncm: str
-    valido: bool
-    descricao_encontrada: str = ""
-    descricao_produto: str = ""
-    aliq_esperada: float = 0.0
-    aliq_informada: float = 0.0
-    divergencias: List[str] = field(default_factory=list)
-    orientacoes: List[str] = field(default_factory=list)
-    sugestao_ncm: Optional[str] = None
+    cfop: str
+    tem_st: bool = False
+    divergencias_st: List[str] = field(default_factory=list)
+    orientacoes_st: List[str] = field(default_factory=list)
+    mva_informado: float = 0.0
+    mva_esperado: float = 0.0
+    vl_bc_st_calculado: float = 0.0
+    vl_bc_st_informado: float = 0.0
+    vl_st_calculado: float = 0.0
+    vl_st_informado: float = 0.0
 
 
-class NCMAnalyzer:
+def _carregar_mva_csv(csv_path: Path) -> Dict[str, Tuple[float, float, float, str]]:
     """
-    Valida NCM e verifica alíquotas de ICMS por produto.
-    Usa tabela CSV local. Se o NCM não for encontrado, orienta.
+    Carrega tabela MVA do CSV.
+    Retorna: {ncm_prefixo: (mva_interno, mva_ajustado_12, aliq_interna, descricao)}
+    Ignora linhas com ativo != "S".
+    """
+    tabela: Dict[str, Tuple[float, float, float, str]] = {}
+    if not csv_path.exists():
+        log.warning("Arquivo MVA nao encontrado: %s", csv_path)
+        return tabela
+    try:
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("ativo", "S").upper() != "S":
+                    continue
+                ncm = row["ncm_prefixo"].strip()
+                tabela[ncm] = (
+                    float(row["mva_interno"]),
+                    float(row["mva_ajustado_12"]),
+                    float(row.get("aliq_interna", 17.0)),
+                    row.get("descricao", ""),
+                )
+        log.debug("MVA-MT carregado: %d registros de %s", len(tabela), csv_path)
+    except Exception as exc:
+        log.error("Erro ao carregar MVA CSV: %s", exc)
+    return tabela
+
+
+class ICMSSTAnalyzer:
+    """
+    Analisa ICMS-ST em NF-e e SPED.
+    Verifica MVA, base de cálculo e valor do ST.
     """
 
     def __init__(self, uf: str):
-        self.uf = uf.upper()
-        self._tabela: Dict[str, RegrasNCM] = {}
-        self._tabela_descricoes: Dict[str, str] = {}  # ncm -> descricao (para sugestão)
-        self._carregar_tabela()
-
-    def _carregar_tabela(self):
-        """Carrega tabela NCM do CSV. Cria CSV padrão se não existir."""
-        csv_path = NCM_MT_CSV if self.uf == "MT" else NCM_MS_CSV
-
-        if not csv_path.exists():
-            self._criar_csv_padrao(csv_path)
-
-        try:
-            with open(csv_path, encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    ncm = row.get("ncm", "").strip().replace(".", "").replace("-", "")
-                    if not ncm:
-                        continue
-                    regra = RegrasNCM(
-                        ncm=ncm,
-                        descricao=row.get("descricao", ""),
-                        aliq_icms_mt=float(row.get("aliq_icms_mt", 17.0) or 17.0),
-                        aliq_icms_ms=float(row.get("aliq_icms_ms", 17.0) or 17.0),
-                        tem_st_mt=row.get("tem_st_mt", "").upper() in ("S", "SIM", "1", "TRUE"),
-                        tem_st_ms=row.get("tem_st_ms", "").upper() in ("S", "SIM", "1", "TRUE"),
-                        reducao_bc_mt=float(row.get("reducao_bc_mt", 0) or 0),
-                        reducao_bc_ms=float(row.get("reducao_bc_ms", 0) or 0),
-                        isento_mt=row.get("isento_mt", "").upper() in ("S", "SIM", "1", "TRUE"),
-                        isento_ms=row.get("isento_ms", "").upper() in ("S", "SIM", "1", "TRUE"),
-                        observacoes=row.get("observacoes", ""),
-                    )
-                    self._tabela[ncm] = regra
-                    # Índice para sugestão por prefixo
-                    self._tabela_descricoes[ncm] = regra.descricao
-        except Exception as e:
-            print(f"[AVISO] Erro ao carregar tabela NCM: {e}")
-
-    def _criar_csv_padrao(self, path: Path):
-        """Cria CSV base com NCMs mais comuns em MT/MS."""
-        cabecalho = [
-            "ncm", "descricao", "aliq_icms_mt", "aliq_icms_ms",
-            "tem_st_mt", "tem_st_ms", "reducao_bc_mt", "reducao_bc_ms",
-            "isento_mt", "isento_ms", "observacoes"
-        ]
-        # Base inicial com NCMs comuns
-        dados = [
-            # NCM, Descricao, aliq_mt, aliq_ms, st_mt, st_ms, red_mt, red_ms, is_mt, is_ms, obs
-            ["01012100", "Cavalos reprodutores raça pura", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["02013000", "Carnes bovinas frescas desossadas", "7", "7", "N", "N", "0", "0", "S", "S", "Isenção ICMS alimentos básicos"],
-            ["02023000", "Carnes bovinas congeladas desossadas", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["02071100", "Frangos inteiros", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["04011000", "Leite fluido", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["04021000", "Leite em pó", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["07019000", "Batatas frescas", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["07031000", "Cebolas frescas", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["07061000", "Cenouras e nabos frescos", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["08051000", "Laranjas frescas", "7", "7", "N", "N", "0", "0", "S", "S", ""],
-            ["10011000", "Trigo duro", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["10051000", "Milho semente", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["10059010", "Milho grão exceto semente", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["12010090", "Soja em grão", "12", "12", "N", "N", "0", "0", "N", "N", "Isenção ICMS exportação"],
-            ["15071100", "Óleo de soja bruto", "17", "17", "N", "N", "0", "0", "N", "N", ""],
-            ["22021000", "Água mineral", "17", "17", "S", "S", "0", "0", "N", "N", "ST"],
-            ["22030000", "Cerveja de malte", "17", "17", "S", "S", "0", "0", "N", "N", "ST obrigatório"],
-            ["27101259", "Gasolina automotiva", "17", "17", "S", "S", "0", "0", "N", "N", "ST monofásico"],
-            ["27102000", "Óleo diesel", "17", "17", "S", "S", "0", "0", "N", "N", "ST monofásico"],
-            ["30021200", "Vacinas veterinárias", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["30049099", "Medicamentos uso humano", "12", "12", "S", "S", "0", "0", "N", "N", "ST medicamentos"],
-            ["33049900", "Cosméticos e perfumaria", "17", "17", "S", "S", "0", "0", "N", "N", "ST cosméticos"],
-            ["40111000", "Pneumáticos automóveis", "17", "17", "S", "S", "0", "0", "N", "N", "ST pneus"],
-            ["40119900", "Pneumáticos outros", "17", "17", "S", "S", "0", "0", "N", "N", "ST pneus"],
-            ["84713000", "Computadores portáteis", "12", "12", "N", "N", "0", "0", "N", "N", ""],
-            ["85171211", "Telefones celulares", "17", "17", "S", "S", "0", "0", "N", "N", "ST eletrônicos"],
-            ["85176292", "Smartphones", "17", "17", "S", "S", "0", "0", "N", "N", "ST eletrônicos"],
-            ["87032190", "Automóveis passageiros", "17", "17", "S", "S", "0", "0", "N", "N", "ST veículos"],
-            ["87089900", "Autopeças em geral", "17", "17", "S", "S", "0", "0", "N", "N", "ST autopeças"],
-        ]
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(cabecalho)
-            writer.writerows(dados)
-
-        print(f"[INFO] Tabela NCM criada em: {path}")
-        print("[INFO] Edite o arquivo CSV para adicionar mais NCMs conforme necessário.")
+        self.uf = "MT"  # sistema opera apenas com MT
+        self.tabela_mva = _carregar_mva_csv(MVA_CSV_PATH)
+        # Alíquota interna padrão para cálculo do ST
+        self.aliq_interna = 17.0
 
     # ─────────────────────────────────────────
-    # VALIDAÇÃO
+    # ANÁLISE NF-e
     # ─────────────────────────────────────────
 
-    def validar_ncm(
+    def analisar_itens_nfe(self, nfe) -> List[ResultadoST]:
+        """Analisa todos os itens de uma NF-e para ICMS-ST."""
+        resultados = []
+        uf_emit = nfe.emitente.endereco.uf.upper()
+        is_interestadual = uf_emit != self.uf
+
+        for item in nfe.itens:
+            res = self._analisar_item(
+                num_item=item.num_item,
+                descricao=item.descricao,
+                ncm=item.ncm,
+                cfop=item.cfop,
+                cst=item.icms.cst,
+                vl_prod=item.vl_total_bruto,
+                vl_frete=0.0,
+                vl_outros=0.0,
+                aliq_interna=self.aliq_interna,
+                aliq_origem=item.icms.aliq,
+                mva_informado=item.icms.p_mva_st,
+                vl_bc_st_informado=item.icms.vl_bc_st,
+                aliq_st_informado=item.icms.aliq_st,
+                vl_st_informado=item.icms.vl_icms_st,
+                is_interestadual=is_interestadual,
+            )
+            resultados.append(res)
+
+        return resultados
+
+    # ─────────────────────────────────────────
+    # ANÁLISE SPED
+    # ─────────────────────────────────────────
+
+    def analisar_item_sped(self, item, is_interestadual: bool,
+                           vl_prod: float, aliq_icms_origem: float) -> ResultadoST:
+        """Analisa um SpedItemNota para ICMS-ST."""
+        ncm = ""  # Buscar do 0200 se necessário
+        return self._analisar_item(
+            num_item=item.num_item,
+            descricao=item.descr_compl or item.cod_item,
+            ncm=ncm,
+            cfop=item.cfop,
+            cst=item.cst_icms,
+            vl_prod=vl_prod,
+            vl_frete=0.0,
+            vl_outros=0.0,
+            aliq_interna=self.aliq_interna,
+            aliq_origem=aliq_icms_origem,
+            mva_informado=item.aliq_st,
+            vl_bc_st_informado=item.vl_bc_icms_st,
+            aliq_st_informado=item.aliq_st,
+            vl_st_informado=item.vl_icms_st,
+            is_interestadual=is_interestadual,
+        )
+
+    # ─────────────────────────────────────────
+    # ANÁLISE CORE
+    # ─────────────────────────────────────────
+
+
+    def analisar_itens(self, dado) -> list:
+        """
+        Metodo unificado para DadoFiscalNormalizado.
+        Substitui analisar_itens_nfe() e analisar_item_sped() no pipeline.
+        """
+        from normalizer import DadoFiscalNormalizado
+        resultados = []
+        uf_emit = dado.emitente.uf.upper() if dado.emitente.uf else ""
+        is_interestadual = bool(uf_emit and uf_emit != self.uf)
+        for item in dado.itens:
+            res = self._analisar_item(
+                num_item=item.num_item,
+                descricao=item.descricao,
+                ncm=item.ncm,
+                cfop=item.cfop,
+                cst=item.cst_icms,
+                vl_prod=item.vl_item,
+                vl_frete=0.0,
+                vl_outros=0.0,
+                aliq_interna=self.aliq_interna,
+                aliq_origem=item.aliq_icms,
+                mva_informado=item.p_mva_st,
+                vl_bc_st_informado=item.vl_bc_st,
+                aliq_st_informado=item.aliq_st,
+                vl_st_informado=item.vl_icms_st,
+                is_interestadual=is_interestadual,
+            )
+            resultados.append(res)
+        return resultados
+
+    def _analisar_item(
         self,
+        num_item: str,
+        descricao: str,
         ncm: str,
-        descricao_produto: str = "",
-        aliq_informada: float = 0.0,
-        cst: str = "",
-    ) -> ResultadoNCM:
-        """Valida um NCM e verifica alíquota/ST."""
+        cfop: str,
+        cst: str,
+        vl_prod: float,
+        vl_frete: float,
+        vl_outros: float,
+        aliq_interna: float,
+        aliq_origem: float,
+        mva_informado: float,
+        vl_bc_st_informado: float,
+        aliq_st_informado: float,
+        vl_st_informado: float,
+        is_interestadual: bool,
+    ) -> ResultadoST:
+
+        res = ResultadoST(
+            num_item=num_item,
+            descricao=descricao[:50],
+            ncm=ncm,
+            cfop=cfop,
+            mva_informado=mva_informado,
+            vl_bc_st_informado=vl_bc_st_informado,
+            vl_st_informado=vl_st_informado,
+        )
+
+        ncm_prefixo = self._ncm_prefixo(ncm)
+        deve_ter_st = ncm_prefixo in self.tabela_mva or cst in CST_COM_ST
+
+        # 1) Produto sujeito a ST mas CST não indica ST
+        if ncm_prefixo in self.tabela_mva and cst and cst not in CST_COM_ST and cst not in ("60",):
+            res.tem_st = True
+            res.divergencias_st.append(
+                f"NCM {ncm} ({self.tabela_mva[ncm_prefixo][2]}) está sujeito a ST "
+                f"em {self.uf}, mas CST informado é {cst}."
+            )
+            res.orientacoes_st.append(
+                f"Para este produto em {self.uf}, utilize CST 10 (saída com retenção ST) "
+                f"ou CST 60 (ICMS-ST já recolhido) conforme posição na cadeia."
+            )
+
+        # 2) Produto com ST: verifica MVA e cálculo
+        if cst in CST_COM_ST and ncm_prefixo in self.tabela_mva:
+            res.tem_st = True
+            mva_interno, mva_ajustado, _aliq_csv, descr_ncm = self.tabela_mva[ncm_prefixo]
+            mva_usar = mva_ajustado if is_interestadual else mva_interno
+            res.mva_esperado = mva_usar
+
+            # MVA informado muito diferente do esperado
+            if mva_informado > 0 and abs(mva_informado - mva_usar) > 2.0:
+                res.divergencias_st.append(
+                    f"MVA informado ({mva_informado:.2f}%) difere do esperado "
+                    f"({mva_usar:.2f}%) para {descr_ncm} em {self.uf}."
+                )
+                res.orientacoes_st.append(
+                    f"Utilize MVA {'ajustado' if is_interestadual else 'interno'} "
+                    f"de {mva_usar:.2f}% conforme tabela SEFAZ-{self.uf} para NCM {ncm}. "
+                    f"Verifique portaria vigente pois MVAs podem ser atualizados."
+                )
+
+            # Calcula BC-ST esperada
+            bc_proprio = vl_prod + vl_frete + vl_outros
+            bc_st_calc = round(bc_proprio * (1 + mva_usar / 100), 2)
+            res.vl_bc_st_calculado = bc_st_calc
+
+            # Calcula ST esperado
+            icms_proprio = round(bc_proprio * aliq_origem / 100, 2) if aliq_origem > 0 else 0.0
+            st_calc = round(bc_st_calc * aliq_interna / 100 - icms_proprio, 2)
+            res.vl_st_calculado = max(st_calc, 0.0)
+
+            # Verifica BC-ST informada
+            if vl_bc_st_informado > 0:
+                if abs(vl_bc_st_informado - bc_st_calc) > 1.0:
+                    res.divergencias_st.append(
+                        f"BC-ST informada (R$ {vl_bc_st_informado:.2f}) difere "
+                        f"da calculada (R$ {bc_st_calc:.2f}) usando MVA {mva_usar:.2f}%."
+                    )
+                    res.orientacoes_st.append(
+                        f"Recalcule: BC-ST = (Vl.Prod + Frete + Outros) × (1 + MVA/100). "
+                        f"BC-ST esperada: R$ {bc_st_calc:.2f}."
+                    )
+
+            # Verifica valor ST informado
+            if vl_st_informado > 0:
+                if abs(vl_st_informado - res.vl_st_calculado) > 1.0:
+                    res.divergencias_st.append(
+                        f"ICMS-ST informado (R$ {vl_st_informado:.2f}) difere "
+                        f"do calculado (R$ {res.vl_st_calculado:.2f})."
+                    )
+                    res.orientacoes_st.append(
+                        f"ST = (BC-ST × Alíq. interna {aliq_interna}%) - ICMS próprio. "
+                        f"ST esperado: R$ {res.vl_st_calculado:.2f}."
+                    )
+
+        # 3) ST informado mas NCM não está na tabela do estado
+        if vl_st_informado > 0 and ncm_prefixo not in self.tabela_mva:
+            res.divergencias_st.append(
+                f"ICMS-ST informado (R$ {vl_st_informado:.2f}) mas NCM {ncm} "
+                f"não consta na tabela ST de {self.uf}."
+            )
+            res.orientacoes_st.append(
+                f"Verifique se o produto NCM {ncm} possui protocolo ou convênio ST "
+                f"específico para {self.uf}. Consulte a SEFAZ-{self.uf} ou o RICMS vigente. "
+                f"Se não houver ST para este NCM, zere os campos de ST."
+            )
+
+        return res
+
+    def _ncm_prefixo(self, ncm: str) -> str:
+        """Retorna os 4 primeiros dígitos do NCM para busca na tabela."""
         ncm_limpo = ncm.replace(".", "").replace("-", "").strip()
+        return ncm_limpo[:4] if len(ncm_limpo) >= 4 else ncm_limpo
 
-        resultado = ResultadoNCM(
-            ncm=ncm_limpo,
-            valido=False,
-            descricao_produto=descricao_produto,
-            aliq_informada=aliq_informada,
-        )
-
-        # 1) NCM com 8 dígitos?
-        if len(ncm_limpo) != 8:
-            resultado.divergencias.append(
-                f"NCM '{ncm}' tem {len(ncm_limpo)} dígitos. NCM deve ter exatamente 8 dígitos."
-            )
-            resultado.orientacoes.append(
-                "Verifique o NCM do produto na Tabela TIPI (Decreto 10.923/2021). "
-                "Consulte: https://www.receita.fazenda.gov.br/aliquotas/tipi.htm"
-            )
-            return resultado
-
-        # 2) Busca na tabela (exata, depois prefixo 6, 4 dígitos)
-        regra = (
-            self._tabela.get(ncm_limpo) or
-            self._buscar_por_prefixo(ncm_limpo, 6) or
-            self._buscar_por_prefixo(ncm_limpo, 4)
-        )
-
-        if regra is None:
-            resultado.valido = True  # Estruturalmente ok, não na tabela local
-            resultado.divergencias.append(
-                f"NCM {ncm_limpo} não encontrado na tabela local de {self.uf}. "
-                "Verifique se o NCM está correto e se há regras específicas."
-            )
-            resultado.orientacoes.append(
-                "Consulte a TIPI na Receita Federal para confirmar o NCM correto. "
-                "Adicione o NCM ao arquivo CSV da tabela local para análises futuras. "
-                f"Arquivo: data/ncm_aliquotas_{self.uf.lower()}.csv"
-            )
-            resultado.sugestao_ncm = self._sugerir_ncm(ncm_limpo, descricao_produto)
-            return resultado
-
-        resultado.valido = True
-        resultado.descricao_encontrada = regra.descricao
-        aliq_esperada = regra.aliq_icms_mt if self.uf == "MT" else regra.aliq_icms_ms
-        resultado.aliq_esperada = aliq_esperada
-        tem_st = regra.tem_st_mt if self.uf == "MT" else regra.tem_st_ms
-        isento = regra.isento_mt if self.uf == "MT" else regra.isento_ms
-
-        # 3) Verifica alíquota informada vs esperada
-        if aliq_informada > 0 and abs(aliq_informada - aliq_esperada) > 0.5:
-            if not isento:
-                resultado.divergencias.append(
-                    f"Alíquota ICMS {aliq_informada}% difere da esperada "
-                    f"{aliq_esperada}% para NCM {ncm_limpo} ({regra.descricao}) em {self.uf}."
-                )
-                resultado.orientacoes.append(
-                    f"A alíquota correta para NCM {ncm_limpo} em {self.uf} é {aliq_esperada}%. "
-                    f"Corrija o cadastro do produto no sistema. {regra.observacoes}"
-                )
-
-        # 4) Produto isento mas com ICMS
-        if isento and aliq_informada > 0:
-            resultado.divergencias.append(
-                f"NCM {ncm_limpo} ({regra.descricao}) é isento de ICMS em {self.uf}, "
-                f"mas alíquota {aliq_informada}% foi informada."
-            )
-            resultado.orientacoes.append(
-                f"Utilize CST 40 (Isenta) para este produto em {self.uf} e "
-                "zere a alíquota/valor de ICMS. Verifique o benefício fiscal aplicável."
-            )
-
-        # 5) Produto tem ST mas CST não indica ST
-        if tem_st and cst and cst not in ("10", "30", "60", "70"):
-            resultado.divergencias.append(
-                f"NCM {ncm_limpo} está sujeito a ICMS-ST em {self.uf}, "
-                f"mas CST {cst} não indica substituição tributária."
-            )
-            resultado.orientacoes.append(
-                f"Produtos com NCM {ncm_limpo} em {self.uf} devem usar CST 10 "
-                "(se o contribuinte é substituto) ou CST 60 "
-                "(se o ICMS-ST já foi retido). Ajuste o CST no sistema."
-            )
-
-        return resultado
-
-    def _buscar_por_prefixo(self, ncm: str, tamanho: int) -> Optional[RegrasNCM]:
-        """Busca NCM por prefixo de n dígitos."""
-        prefixo = ncm[:tamanho]
-        for ncm_tab, regra in self._tabela.items():
-            if ncm_tab.startswith(prefixo):
-                return regra
-        return None
-
-    def _sugerir_ncm(self, ncm: str, descricao: str) -> Optional[str]:
-        """Sugere NCM similar pelo prefixo de 4 dígitos."""
-        if not self._tabela:
-            return None
-        prefixo = ncm[:4]
-        candidatos = [n for n in self._tabela if n.startswith(prefixo)]
-        if candidatos:
-            return candidatos[0]
-        return None
-
-    def validar_lista(self, itens: List[Tuple]) -> List[ResultadoNCM]:
-        """
-        Valida uma lista de itens.
-        itens: [(ncm, descricao, aliq, cst), ...]
-        """
-        return [
-            self.validar_ncm(ncm, desc, aliq, cst)
-            for ncm, desc, aliq, cst in itens
-        ]
-
-    def resumo(self, resultados: List[ResultadoNCM]) -> Dict:
+    def resumo_st(self, resultados: List[ResultadoST]) -> Dict:
+        """Gera resumo consolidado da análise ST."""
+        total_st_doc = sum(r.vl_st_informado for r in resultados)
+        total_st_calc = sum(r.vl_st_calculado for r in resultados)
+        itens_com_diverg = [r for r in resultados if r.divergencias_st]
         return {
-            "total": len(resultados),
-            "validos": sum(1 for r in resultados if r.valido),
-            "com_divergencia": sum(1 for r in resultados if r.divergencias),
-            "invalidos": sum(1 for r in resultados if not r.valido),
+            "total_itens": len(resultados),
+            "itens_com_st": sum(1 for r in resultados if r.tem_st),
+            "itens_com_divergencia": len(itens_com_diverg),
+            "total_st_documento": total_st_doc,
+            "total_st_calculado": total_st_calc,
+            "diferenca_st": abs(total_st_doc - total_st_calc),
         }

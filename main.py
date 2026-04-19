@@ -1,250 +1,271 @@
-# main.py
+# main.py  (execute como: python -m sped_icms_analyzer.main)
 """
-SPED ICMS Analyzer - Ponto de entrada CLI
-Uso: python main.py --help
+SPED ICMS Analyzer - MT
+Ponto de entrada CLI.
+
+Uso recomendado (a partir da pasta PAI do projeto):
+    python -m sped_icms_analyzer.main --help
 
 Exemplos:
-  python main.py --tipo sped --arquivo minha_efd.txt --uf MT
-  python main.py --tipo nfe --arquivo nota.xml --uf MS
-  python main.py --tipo nfce --arquivo cupom.xml --uf MT
-  python main.py --tipo pasta --pasta ./xmls/ --uf MT
-  python main.py --treinar
-  python main.py --status-ml
+    python -m sped_icms_analyzer.main --tipo nfe   --arquivo nota.xml
+    python -m sped_icms_analyzer.main --tipo sped  --arquivo EFD_01_2024.txt
+    python -m sped_icms_analyzer.main --tipo pasta --pasta ./xmls/
+    python -m sped_icms_analyzer.main --comparar   --pasta ./xmls/ --sped EFD.txt
+    python -m sped_icms_analyzer.main --treinar
+    python -m sped_icms_analyzer.main --status-ml
 """
 
 import argparse
+import logging
 import sys
-import os
 from pathlib import Path
-from tqdm import tqdm
-
-# Garante que o diretório do projeto está no PYTHONPATH
-sys.path.insert(0, str(Path(__file__).parent))
 
 from colorama import Fore, Style, init
+
+from config import UF_PADRAO, REPORTS_DIR
+from pipeline import Pipeline, ResultadoFinal
+from alerts.alert_engine import AlertEngine
+from reports.report_generator import ReportGenerator
+
 init(autoreset=True)
+log = logging.getLogger(__name__)
+
+# UF fixo: apenas Mato Grosso
+UF = UF_PADRAO
 
 
-def _banner():
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _banner() -> None:
     print(Fore.CYAN + Style.BRIGHT + """
-╔══════════════════════════════════════════════════════════╗
-║        SPED ICMS ANALYZER - MT/MS                        ║
-║        Análise Fiscal com Machine Learning               ║
-╚══════════════════════════════════════════════════════════╝
++----------------------------------------------------------+
+|        SPED ICMS ANALYZER - MT                           |
+|        Analise Fiscal com Machine Learning               |
++----------------------------------------------------------+
 """ + Style.RESET_ALL)
 
 
-def analisar_nfe(caminho: str, uf: str, verbose: bool = True):
-    """Pipeline completo: parse → análise → ML → alerta → relatório."""
-    from parsers.nfe_parser import NFeParser
-    from analyzers.icms_analyzer import ICMSAnalyzer
-    from analyzers.icms_st_analyzer import ICMSSTAnalyzer
-    from analyzers.ncm_analyzer import NCMAnalyzer
-    from ml.risk_classifier import RiskClassifier
-    from alerts.alert_engine import AlertEngine
-    from reports.report_generator import ReportGenerator
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLERS DE COMANDO
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # 1. Parse
-    nfe = NFeParser(caminho).parse()
-    if nfe.erros_leitura:
-        for erro in nfe.erros_leitura:
-            print(Fore.RED + f"[ERRO PARSE] {erro}")
-        return None, None
-
-    # 2. Análise ICMS
-    icms = ICMSAnalyzer(uf)
-    resultado = icms.analisar_nfe(nfe)
-
-    # 3. Análise ST
-    st_analyzer = ICMSSTAnalyzer(uf)
-    resultados_st = st_analyzer.analisar_itens_nfe(nfe)
-
-    # 4. Análise NCM
-    ncm_analyzer = NCMAnalyzer(uf)
-    itens_ncm = [
-        (item.ncm, item.descricao, item.icms.aliq, item.icms.cst)
-        for item in nfe.itens
-    ]
-    resultados_ncm = ncm_analyzer.validar_lista(itens_ncm)
-
-    # 5. Classificação ML
-    classifier = RiskClassifier()
-    classif = classifier.classificar(resultado)
-
-    # 6. Alertas no terminal
-    if verbose:
-        alert = AlertEngine()
-        alert.exibir_resultado_icms(resultado, classif, resultados_st, resultados_ncm)
-
-    return resultado, classif
+def _exibir_resultado(res: ResultadoFinal, alert: AlertEngine) -> None:
+    """Exibe resultado de um documento no terminal."""
+    if not res.sucesso:
+        print(Fore.RED + f"[ERRO] {res.dado.caminho_arquivo}: {res.erro}")
+        return
+    alert.exibir_resultado_icms(
+        resultado=res.icms,
+        classificacao_ml=res.classificacao,
+        resultados_st=res.st,
+        resultados_ncm=res.ncm,
+    )
 
 
-def analisar_sped(caminho: str, uf: str, verbose: bool = True):
-    """Pipeline SPED Fiscal."""
-    from parsers.sped_parser import SpedParser
-    from analyzers.icms_analyzer import ICMSAnalyzer
-    from analyzers.icms_st_analyzer import ICMSSTAnalyzer
-    from analyzers.ncm_analyzer import NCMAnalyzer
-    from ml.risk_classifier import RiskClassifier
-    from alerts.alert_engine import AlertEngine
+def cmd_nfe(caminho: str, sem_relatorio: bool) -> None:
+    """Processa um arquivo XML (NF-e ou NFC-e)."""
+    pipe  = Pipeline(UF)
+    alert = AlertEngine()
 
-    sped = SpedParser(caminho).parse()
-    if sped.erros_leitura and verbose:
-        print(Fore.YELLOW + f"[AVISO] {len(sped.erros_leitura)} erro(s) na leitura do SPED:")
-        for e in sped.erros_leitura[:5]:
-            print(f"  {e}")
-
-    if not sped.notas:
-        print(Fore.RED + "[ERRO] Nenhuma nota fiscal encontrada no SPED.")
-        return [], []
-
-    print(f"\n{Fore.CYAN}[INFO] {len(sped.notas)} nota(s) encontrada(s) no SPED.{Style.RESET_ALL}")
-
-    icms = ICMSAnalyzer(uf)
-    st_analyzer = ICMSSTAnalyzer(uf)
-    ncm_analyzer = NCMAnalyzer(uf)
-    classifier = RiskClassifier()
-
-    todos_resultados = []
-    todas_classifs = []
-
-    for nota in tqdm(sped.notas, desc="Analisando notas", unit="NF"):
-        resultado = icms.analisar_nota_sped(nota, sped.produtos)
-        classif = classifier.classificar(resultado)
-        todos_resultados.append(resultado)
-        todas_classifs.append(classif)
-
-    if verbose:
-        alert = AlertEngine()
-        # Exibe detalhes apenas das notas com risco alto/médio
-        for resultado, classif in zip(todos_resultados, todas_classifs):
-            if classif.get("risco") in ("ALTO", "MEDIO"):
-                alert.exibir_resultado_icms(resultado, classif)
-        alert.exibir_resumo_lote(todos_resultados, todas_classifs)
-
-    return todos_resultados, todas_classifs
-
-
-def analisar_pasta(pasta: str, uf: str):
-    """Analisa todos os XMLs e SPEDs de uma pasta."""
-    path = Path(pasta)
-    if not path.exists():
-        print(Fore.RED + f"[ERRO] Pasta não encontrada: {pasta}")
+    res = pipe.processar_xml(caminho)
+    if res is None:
+        print(Fore.RED + f"[ERRO] Nao foi possivel processar: {caminho}")
         sys.exit(1)
 
-    xmls = list(path.glob("*.xml")) + list(path.glob("*.XML"))
-    speds = list(path.glob("*.txt")) + list(path.glob("*.TXT"))
+    _exibir_resultado(res, alert)
+    alert.orientacao_geral(UF)
 
-    print(f"[INFO] Encontrados: {len(xmls)} XML(s), {len(speds)} SPED(s)")
+    if not sem_relatorio and res.sucesso:
+        rpt = ReportGenerator(UF)
+        arquivos = rpt.gerar_relatorio_completo(
+            [res.icms], [res.classificacao],
+            resultados_st=[[res.st]],
+            resultados_ncm=[[res.ncm]],
+        )
+        _imprimir_arquivos(arquivos)
 
-    todos_resultados = []
-    todas_classifs = []
 
-    # Processa XMLs
-    for xml_path in tqdm(xmls, desc="XMLs NF-e/NFC-e"):
-        res, clf = analisar_nfe(str(xml_path), uf, verbose=False)
-        if res:
-            todos_resultados.append(res)
-            todas_classifs.append(clf)
+def cmd_sped(caminho: str, sem_relatorio: bool) -> None:
+    """Processa um arquivo SPED Fiscal (.txt)."""
+    pipe  = Pipeline(UF)
+    alert = AlertEngine()
 
-    # Processa SPEDs
-    for sped_path in tqdm(speds, desc="SPEDs"):
-        resu, clfs = analisar_sped(str(sped_path), uf, verbose=False)
-        todos_resultados.extend(resu)
-        todas_classifs.extend(clfs)
+    print(Fore.CYAN + f"[INFO] Processando SPED: {caminho}" + Style.RESET_ALL)
+    resultados = pipe.processar_sped(caminho)
 
-    if not todos_resultados:
-        print(Fore.YELLOW + "[AVISO] Nenhum documento processado com sucesso.")
+    if not resultados:
+        print(Fore.RED + "[ERRO] Nenhuma nota processada no SPED.")
+        sys.exit(1)
+
+    icms_list  = [r.icms for r in resultados]
+    clf_list   = [r.classificacao for r in resultados]
+
+    for res in resultados:
+        if res.risco in ("ALTO", "MEDIO"):
+            _exibir_resultado(res, alert)
+
+    alert.exibir_resumo_lote(icms_list, clf_list)
+    alert.orientacao_geral(UF)
+
+    if not sem_relatorio:
+        rpt = ReportGenerator(UF, prefixo="sped")
+        arquivos = rpt.gerar_relatorio_completo(icms_list, clf_list)
+        _imprimir_arquivos(arquivos)
+
+
+def cmd_pasta(pasta: str, sem_relatorio: bool) -> None:
+    """Processa todos os documentos de uma pasta com paralelismo."""
+    pipe  = Pipeline(UF)
+    alert = AlertEngine()
+
+    if sem_relatorio:
+        # Streaming: exibe e descarta
+        icms_list, clf_list = [], []
+        for res in pipe.processar_pasta(pasta):
+            if res.risco in ("ALTO", "MEDIO"):
+                _exibir_resultado(res, alert)
+            icms_list.append(res.icms)
+            clf_list.append(res.classificacao)
+        alert.exibir_resumo_lote(icms_list, clf_list)
+        alert.orientacao_geral(UF)
+    else:
+        # Escrita incremental: nao acumula em RAM
+        from datetime import datetime
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        arq = pipe.processar_pasta_para_csv(pasta, f"lote_{UF}_{ts}.csv")
+        print(Fore.GREEN + f"[OK] CSV gerado: {arq}" + Style.RESET_ALL)
+        alert.orientacao_geral(UF)
+
+
+def cmd_comparar(pasta: str, caminho_sped: str, sem_relatorio: bool) -> None:
+    """Cruza XMLs de uma pasta com um arquivo SPED."""
+    from comparador.relatorio_comparador import AlertaComparador, RelatorioComparador
+    from comparador.comparador_nfe_sped import ComparadorNFeSped
+
+    comp = ComparadorNFeSped(caminho_sped, pasta, UF)
+    resultados = comp.comparar()
+
+    if not resultados:
+        print(Fore.YELLOW + "[AVISO] Nenhum resultado gerado.")
         return
 
-    # Resumo
-    from alerts.alert_engine import AlertEngine
-    from reports.report_generator import ReportGenerator
-    alert = AlertEngine()
-    alert.exibir_resumo_lote(todos_resultados, todas_classifs)
-    alert.orientacao_geral(uf)
+    alerta = AlertaComparador()
+    for res in resultados:
+        if res.status != "OK":
+            alerta.exibir_resultado(res)
 
-    # Relatórios
-    rpt = ReportGenerator(uf, prefixo="lote")
-    arquivos = rpt.gerar_relatorio_completo(todos_resultados, todas_classifs)
-    print(f"\n{Fore.GREEN}[OK] Relatórios gerados:{Style.RESET_ALL}")
-    for arq in arquivos:
-        print(f"  📄 {arq}")
+    alerta.exibir_resumo(
+        resultados,
+        comp._dt_ini_sped,
+        comp._dt_fin_sped,
+        comp._cnpj_contribuinte,
+    )
 
-
-def gerar_relatorio_unico(resultado, classif, uf: str):
-    """Gera relatório para análise de documento único."""
-    from reports.report_generator import ReportGenerator
-    rpt = ReportGenerator(uf)
-    arquivos = rpt.gerar_relatorio_completo([resultado], [classif])
-    print(f"\n{Fore.GREEN}[OK] Relatórios gerados:{Style.RESET_ALL}")
-    for arq in arquivos:
-        print(f"  📄 {arq}")
+    if not sem_relatorio:
+        rpt = RelatorioComparador(UF)
+        _imprimir_arquivos(rpt.gerar_todos(resultados))
 
 
-def cmd_treinar():
+def cmd_treinar() -> None:
     """Treina ou retreina o modelo ML."""
     from ml.model_trainer import treinar_modelo, status_modelo
-    status = status_modelo()
-    print(f"\n[INFO] Status do modelo:")
-    print(f"  Modelo existe      : {'Sim' if status['modelo_existe'] else 'Não'}")
-    print(f"  Amostras históricas: {status['amostras_historico']}")
-    print(f"  Pronto (≥10 reais) : {'Sim' if status['pronto_para_treino_real'] else 'Não'}\n")
+    st = status_modelo()
+    print(f"
+[INFO] Status do modelo:")
+    print(f"  Modelo existe      : {'Sim' if st['modelo_existe'] else 'Nao'}")
+    print(f"  Amostras historicas: {st['amostras_historico']}")
+    print(f"  Pronto (>=10 reais): {'Sim' if st['pronto_para_treino_real'] else 'Nao'}
+")
     treinar_modelo(verbose=True)
 
 
-def cmd_status_ml():
-    """Exibe status do modelo ML e importância das features."""
+def cmd_status_ml() -> None:
+    """Exibe status do modelo ML e importancia das features."""
     from ml.model_trainer import status_modelo
     from ml.risk_classifier import RiskClassifier
-    status = status_modelo()
-    print(f"\n{Fore.CYAN}=== STATUS ML ==={Style.RESET_ALL}")
-    print(f"Modelo       : {'✅ Carregado' if status['modelo_existe'] else '❌ Não encontrado'}")
-    print(f"Amostras     : {status['amostras_historico']}")
-    print(f"Caminho      : {status['caminho_modelo']}")
-    print(f"Histórico    : {status['caminho_historico']}")
-
+    st  = status_modelo()
     clf = RiskClassifier()
+    print(Fore.CYAN + "=== STATUS ML ===" + Style.RESET_ALL)
+    print(f"Modelo    : {'Carregado' if st['modelo_existe'] else 'Nao encontrado'}")
+    print(f"Amostras  : {st['amostras_historico']}")
+    print(f"Caminho   : {st['caminho_modelo']}")
+    print(f"Usando ML : {'Sim (Random Forest)' if clf.usa_ml else 'Nao (regras)'}")
     if clf.usa_ml:
-        print(f"\nUsando ML    : Sim (Random Forest)")
         imp = clf.importancia_features()
         if imp:
-            print(f"\n{Fore.CYAN}Top 8 features:{Style.RESET_ALL}")
+            print(Fore.CYAN + "
+Top 8 features:" + Style.RESET_ALL)
             for feat, val in list(imp.items())[:8]:
-                barra = "█" * int(val * 40)
-                print(f"  {feat:<30} {barra} {val:.3f}")
+                barra = "#" * int(val * 40)
+                print(f"  {feat:<32} {barra} {val:.3f}")
     else:
-        print(f"\nUsando ML    : Não (modo regras)")
-        print("Execute: python main.py --treinar")
+        print("Execute: python -m sped_icms_analyzer.main --treinar")
 
 
-# ─────────────────────────────────────────────
+def _imprimir_arquivos(arquivos) -> None:
+    print(Fore.GREEN + "[OK] Relatorios gerados:" + Style.RESET_ALL)
+    for arq in arquivos:
+        if arq:
+            print(f"  {arq}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-def main():
+def _configurar_log(debug: bool) -> None:
+    nivel = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=nivel,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def main() -> None:
     _banner()
 
     parser = argparse.ArgumentParser(
-        description="SPED ICMS Analyzer - Análise fiscal MT/MS",
-        formatter_class=argparse.RawTextHelpFormatter
+        prog="python -m sped_icms_analyzer.main",
+        description="SPED ICMS Analyzer - Analise fiscal MT",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--tipo", choices=["sped", "nfe", "nfce", "pasta"],
-                        help="Tipo de arquivo a analisar")
+
+    parser.add_argument(
+        "--tipo", choices=["sped", "nfe", "nfce", "pasta"],
+        help="Tipo de arquivo a analisar"
+    )
     parser.add_argument("--arquivo", help="Caminho do arquivo a analisar")
-    parser.add_argument("--pasta", help="Caminho da pasta com múltiplos arquivos")
-    parser.add_argument("--uf", choices=["MT", "MS"], default="MT",
-                        help="UF para regras ICMS (padrão: MT)")
-    parser.add_argument("--treinar", action="store_true",
-                        help="Treina/retreina o modelo ML")
-    parser.add_argument("--status-ml", action="store_true",
-                        help="Exibe status do modelo ML")
-    parser.add_argument("--relatorio", action="store_true", default=True,
-                        help="Gera relatórios CSV/TXT (padrão: ativo)")
-    parser.add_argument("--sem-relatorio", action="store_true",
-                        help="Desativa geração de relatórios")
+    parser.add_argument("--pasta",   help="Caminho da pasta com XMLs ou documentos")
+    parser.add_argument("--sped",    help="Caminho do SPED .txt (usado com --comparar)")
+
+    parser.add_argument(
+        "--comparar", action="store_true",
+        help="Cruza XMLs de --pasta com o SPED de --sped"
+    )
+    parser.add_argument(
+        "--treinar", action="store_true",
+        help="Treina/retreina o modelo ML com historico acumulado"
+    )
+    parser.add_argument(
+        "--status-ml", action="store_true",
+        help="Exibe status do modelo ML e importancia das features"
+    )
+
+    # CLI corrigido: dois flags independentes sem conflito
+    parser.add_argument(
+        "--sem-relatorio", action="store_true",
+        help="Nao gera arquivos de relatorio (apenas exibe no terminal)"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Ativa log detalhado (DEBUG)"
+    )
 
     args = parser.parse_args()
+    _configurar_log(args.debug)
 
     if args.treinar:
         cmd_treinar()
@@ -254,39 +275,38 @@ def main():
         cmd_status_ml()
         return
 
-    if args.tipo == "pasta":
-        if not args.pasta:
-            print(Fore.RED + "[ERRO] Informe --pasta para análise em lote.")
-            sys.exit(1)
-        analisar_pasta(args.pasta, args.uf)
+    if args.comparar:
+        if not args.pasta or not args.sped:
+            parser.error("--comparar requer --pasta e --sped")
+        cmd_comparar(args.pasta, args.sped, args.sem_relatorio)
         return
 
-    if not args.tipo or not args.arquivo:
-        parser.print_help()
-        print(f"\n{Fore.YELLOW}Exemplos de uso:{Style.RESET_ALL}")
-        print("  python main.py --tipo sped --arquivo EFD_2024_01.txt --uf MT")
-        print("  python main.py --tipo nfe  --arquivo nota_fiscal.xml --uf MS")
-        print("  python main.py --tipo pasta --pasta ./documentos/ --uf MT")
-        print("  python main.py --treinar")
+    if args.tipo == "pasta":
+        if not args.pasta:
+            parser.error("--tipo pasta requer --pasta")
+        cmd_pasta(args.pasta, args.sem_relatorio)
         return
 
     if args.tipo in ("nfe", "nfce"):
-        resultado, classif = analisar_nfe(args.arquivo, args.uf)
-        if resultado and classif and not args.sem_relatorio:
-            gerar_relatorio_unico(resultado, classif, args.uf)
+        if not args.arquivo:
+            parser.error(f"--tipo {args.tipo} requer --arquivo")
+        cmd_nfe(args.arquivo, args.sem_relatorio)
+        return
 
-    elif args.tipo == "sped":
-        resultados, classifs = analisar_sped(args.arquivo, args.uf)
-        if resultados and not args.sem_relatorio:
-            from reports.report_generator import ReportGenerator
-            rpt = ReportGenerator(args.uf, prefixo="sped")
-            arquivos = rpt.gerar_relatorio_completo(resultados, classifs)
-            print(f"\n{Fore.GREEN}[OK] Relatórios gerados:{Style.RESET_ALL}")
-            for arq in arquivos:
-                print(f"  📄 {arq}")
+    if args.tipo == "sped":
+        if not args.arquivo:
+            parser.error("--tipo sped requer --arquivo")
+        cmd_sped(args.arquivo, args.sem_relatorio)
+        return
 
-    from alerts.alert_engine import AlertEngine
-    AlertEngine().orientacao_geral(args.uf)
+    # Nenhum comando reconhecido
+    parser.print_help()
+    print(Fore.YELLOW + "\nExemplos:" + Style.RESET_ALL)
+    print("  python -m sped_icms_analyzer.main --tipo nfe   --arquivo nota.xml")
+    print("  python -m sped_icms_analyzer.main --tipo sped  --arquivo EFD_01_2024.txt")
+    print("  python -m sped_icms_analyzer.main --tipo pasta --pasta ./xmls/")
+    print("  python -m sped_icms_analyzer.main --comparar   --pasta ./xmls/ --sped EFD.txt")
+    print("  python -m sped_icms_analyzer.main --treinar")
 
 
 if __name__ == "__main__":

@@ -1,23 +1,39 @@
 # analyzers/icms_st_analyzer.py
 """
-Análise específica de ICMS por Substituição Tributária (ICMS-ST).
-Foco: MT e MS - protocolos e convênios específicos.
+Analise de ICMS por Substituicao Tributaria (ICMS-ST) - MT.
 
-Principais referências:
-  - Protocolo ICMS 41/2008 (combustíveis)
-  - Convênio ICMS 52/1991 (máquinas e equipamentos)
-  - Protocolos específicos MT e MS
-  - TARE (MT) - Termo de Acordo de Regime Especial
+MVAs carregados de data/mva_mt.csv (versionavel, editavel sem alterar codigo).
+Formato do CSV:
+  ncm_prefixo, descricao, mva_interno, mva_ajustado_12,
+  aliq_interna, ativo, fonte
+
+Para atualizar MVAs: edite data/mva_mt.csv e reinicie o sistema.
+Nao e necessario alterar este arquivo.
+
+Referencias:
+  - Protocolo ICMS 41/2008 (combustiveis)
+  - Convenio ICMS 142/2018 (bebidas)
+  - Protocolo ICMS 76/2014 (medicamentos)
+  - TARE-MT (Termo de Acordo de Regime Especial)
 """
 
+import csv
+import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
-from config import TOLERANCIA_PERCENTUAL, CST_COM_ST
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from config import TOLERANCIA_PERCENTUAL, CST_COM_ST, DATA_DIR
+
+log = logging.getLogger(__name__)
+
+# Caminho do CSV de MVAs (versionavel)
+MVA_CSV_PATH: Path = DATA_DIR / "mva_mt.csv"
 
 
 @dataclass
 class ResultadoST:
-    """Resultado da análise de ST de um item"""
+    """Resultado da analise de ST de um item."""
     num_item: str
     descricao: str
     ncm: str
@@ -33,56 +49,32 @@ class ResultadoST:
     vl_st_informado: float = 0.0
 
 
-# ─────────────────────────────────────────────
-# TABELA MVA INTERNOS (ST) - MT/MS
-# Fonte: Anexos RICMS-MT e RICMS-MS
-# ATENÇÃO: Esta tabela é uma base inicial.
-# Mantenha atualizada conforme portarias SEFAZ.
-# ─────────────────────────────────────────────
-
-MVA_MT = {
-    # NCM: (MVA_interno%, MVA_ajustado_interestadual_12%, descricao)
-    "2710": (30.0, 58.18, "Combustíveis e lubrificantes"),
-    "8544": (40.0, 50.0, "Fios, cabos e condutores"),
-    "3002": (33.0, 43.0, "Medicamentos"),
-    "3003": (33.0, 43.0, "Medicamentos"),
-    "3004": (33.0, 43.0, "Medicamentos"),
-    "2201": (30.0, 40.0, "Água mineral"),
-    "2202": (30.0, 40.0, "Bebidas não alcoólicas"),
-    "2203": (40.0, 54.0, "Cerveja"),
-    "2204": (35.0, 47.0, "Vinhos"),
-    "2208": (45.0, 60.0, "Aguardente/cachaça"),
-    "2402": (25.0, 36.0, "Cigarros"),
-    "8471": (30.0, 42.0, "Computadores"),
-    "8517": (30.0, 42.0, "Celulares e telefones"),
-    "3304": (30.0, 42.0, "Cosméticos e perfumaria"),
-    "3305": (30.0, 42.0, "Cosméticos - cabelos"),
-    "3401": (30.0, 42.0, "Sabões e detergentes"),
-    "7217": (30.0, 42.0, "Arames e fios de aço"),
-    "3906": (35.0, 47.0, "Tintas e vernizes"),
-    "3208": (35.0, 47.0, "Tintas e vernizes"),
-    "8483": (30.0, 42.0, "Rolamentos e transmissão"),
-    "4011": (42.0, 57.0, "Pneumáticos - automóveis"),
-    "4012": (42.0, 57.0, "Pneumáticos recauchutados"),
-    "8708": (42.0, 57.0, "Autopeças"),
-}
-
-MVA_MS = {
-    "2710": (30.0, 58.18, "Combustíveis e lubrificantes"),
-    "3002": (33.0, 43.0, "Medicamentos"),
-    "3003": (33.0, 43.0, "Medicamentos"),
-    "3004": (33.0, 43.0, "Medicamentos"),
-    "2201": (26.0, 36.0, "Água mineral"),
-    "2202": (26.0, 36.0, "Bebidas não alcoólicas"),
-    "2203": (40.0, 54.0, "Cerveja"),
-    "4011": (42.0, 57.0, "Pneumáticos - automóveis"),
-    "8708": (30.0, 45.0, "Autopeças"),
-    "3304": (30.0, 42.0, "Cosméticos"),
-    "3208": (35.0, 47.0, "Tintas e vernizes"),
-}
-
-# NCMs que tipicamente têm ST em MT/MS
-NCM_COM_ST_MT_MS = set(MVA_MT.keys()) | set(MVA_MS.keys())
+def _carregar_mva_csv(csv_path: Path) -> Dict[str, Tuple[float, float, float, str]]:
+    """
+    Carrega tabela MVA do CSV.
+    Retorna: {ncm_prefixo: (mva_interno, mva_ajustado_12, aliq_interna, descricao)}
+    Ignora linhas com ativo != "S".
+    """
+    tabela: Dict[str, Tuple[float, float, float, str]] = {}
+    if not csv_path.exists():
+        log.warning("Arquivo MVA nao encontrado: %s", csv_path)
+        return tabela
+    try:
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("ativo", "S").upper() != "S":
+                    continue
+                ncm = row["ncm_prefixo"].strip()
+                tabela[ncm] = (
+                    float(row["mva_interno"]),
+                    float(row["mva_ajustado_12"]),
+                    float(row.get("aliq_interna", 17.0)),
+                    row.get("descricao", ""),
+                )
+        log.debug("MVA-MT carregado: %d registros de %s", len(tabela), csv_path)
+    except Exception as exc:
+        log.error("Erro ao carregar MVA CSV: %s", exc)
+    return tabela
 
 
 class ICMSSTAnalyzer:
@@ -92,8 +84,8 @@ class ICMSSTAnalyzer:
     """
 
     def __init__(self, uf: str):
-        self.uf = uf.upper()
-        self.tabela_mva = MVA_MT if self.uf == "MT" else MVA_MS
+        self.uf = "MT"  # sistema opera apenas com MT
+        self.tabela_mva = _carregar_mva_csv(MVA_CSV_PATH)
         # Alíquota interna padrão para cálculo do ST
         self.aliq_interna = 17.0
 
@@ -159,6 +151,37 @@ class ICMSSTAnalyzer:
     # ANÁLISE CORE
     # ─────────────────────────────────────────
 
+
+    def analisar_itens(self, dado) -> list:
+        """
+        Metodo unificado para DadoFiscalNormalizado.
+        Substitui analisar_itens_nfe() e analisar_item_sped() no pipeline.
+        """
+        from normalizer import DadoFiscalNormalizado
+        resultados = []
+        uf_emit = dado.emitente.uf.upper() if dado.emitente.uf else ""
+        is_interestadual = bool(uf_emit and uf_emit != self.uf)
+        for item in dado.itens:
+            res = self._analisar_item(
+                num_item=item.num_item,
+                descricao=item.descricao,
+                ncm=item.ncm,
+                cfop=item.cfop,
+                cst=item.cst_icms,
+                vl_prod=item.vl_item,
+                vl_frete=0.0,
+                vl_outros=0.0,
+                aliq_interna=self.aliq_interna,
+                aliq_origem=item.aliq_icms,
+                mva_informado=item.p_mva_st,
+                vl_bc_st_informado=item.vl_bc_st,
+                aliq_st_informado=item.aliq_st,
+                vl_st_informado=item.vl_icms_st,
+                is_interestadual=is_interestadual,
+            )
+            resultados.append(res)
+        return resultados
+
     def _analisar_item(
         self,
         num_item: str,
@@ -206,7 +229,7 @@ class ICMSSTAnalyzer:
         # 2) Produto com ST: verifica MVA e cálculo
         if cst in CST_COM_ST and ncm_prefixo in self.tabela_mva:
             res.tem_st = True
-            mva_interno, mva_ajustado, descr_ncm = self.tabela_mva[ncm_prefixo]
+            mva_interno, mva_ajustado, _aliq_csv, descr_ncm = self.tabela_mva[ncm_prefixo]
             mva_usar = mva_ajustado if is_interestadual else mva_interno
             res.mva_esperado = mva_usar
 
